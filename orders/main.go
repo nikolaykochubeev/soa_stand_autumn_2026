@@ -1,7 +1,4 @@
-// Orders — наивная реализация.
-//
-// Оформление заказа: зарезервировать товар в Inventory, списать деньги в
-// Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
+// Orders persists work before contacting other services.
 package main
 
 import (
@@ -13,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,8 +27,19 @@ CREATE TABLE IF NOT EXISTS orders (
     status       TEXT NOT NULL,
     amount_cents BIGINT NOT NULL,
     items        JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-)`
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_sent   BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS orders_pending ON orders (next_attempt) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS orders_outbox ON orders (created_at) WHERE status = 'paid' AND NOT event_sent;
+CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    points BIGINT NOT NULL CHECK (points > 0)
+);
+CREATE INDEX IF NOT EXISTS deliveries_user ON deliveries (user_id);
+`
 
 type Item struct {
 	SKU        string `json:"sku"`
@@ -43,15 +53,21 @@ type OrderRequest struct {
 }
 
 type app struct {
-	db           *pgxpool.Pool
-	paymentURL   string
-	inventoryURL string
+	db              *pgxpool.Pool
+	paymentURL      string
+	inventoryURL    string
+	eventsURL       string
+	paymentMu       sync.Mutex
+	paymentRetry    time.Time
+	paymentProbe    bool
+	paymentFailures int
 }
 
 func main() {
 	a := &app{
 		paymentURL:   strings.TrimRight(mustEnv("PAYMENT_URL"), "/"),
 		inventoryURL: strings.TrimRight(mustEnv("INVENTORY_URL"), "/"),
+		eventsURL:    strings.TrimRight(os.Getenv("EVENTS_URL"), "/"),
 	}
 	db, err := connect(mustEnv("DATABASE_URL"))
 	if err != nil {
@@ -59,6 +75,9 @@ func main() {
 		os.Exit(1)
 	}
 	a.db = db
+	defer db.Close()
+	go a.workOrders(context.Background())
+	go a.publishEvents(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -66,6 +85,8 @@ func main() {
 	})
 	mux.HandleFunc("POST /orders", a.createOrder)
 	mux.HandleFunc("GET /orders/{id}", a.getOrder)
+	mux.HandleFunc("POST /webhooks/delivery", a.delivery)
+	mux.HandleFunc("GET /users/{id}/bonus", a.bonus)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -98,7 +119,13 @@ func connect(url string) (*pgxpool.Pool, error) {
 
 func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req OrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !valid(req) {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := decoder.Decode(&req); err != nil || !valid(req) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
+		return
+	}
+	var extra any
+	if decoder.Decode(&extra) != io.EOF {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request"})
 		return
 	}
@@ -107,32 +134,17 @@ func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
 	for _, it := range req.Items {
 		amount += int64(it.Qty) * it.PriceCents
 	}
-
-	if err := a.reserve(id, req.Items); err != nil {
-		a.fail(w, id, err)
-		return
-	}
-	declined, err := a.charge(id, amount)
-	if err != nil {
-		a.fail(w, id, err)
-		return
-	}
-	status := "paid"
-	if declined {
-		a.release(id)
-		status = "rejected"
-	}
-
 	items, _ := json.Marshal(req.Items)
-	_, err = a.db.Exec(context.Background(),
-		`INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES ($1, $2, $3, $4, $5)`,
-		id, req.UserID, status, amount, items)
+	ctx, cancel := context.WithTimeout(r.Context(), 800*time.Millisecond)
+	defer cancel()
+	_, err := a.db.Exec(ctx,
+		"INSERT INTO orders (id, user_id, status, amount_cents, items) VALUES ($1, $2, 'pending', $3, $4)",
+		id, req.UserID, amount, items)
 	if err != nil {
 		a.fail(w, id, err)
 		return
 	}
-	slog.Info("order", "id", id, "status", status)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": status})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": "pending"})
 }
 
 func (a *app) fail(w http.ResponseWriter, id string, err error) {
@@ -173,19 +185,52 @@ func (a *app) reserve(id string, items []Item) error {
 	return nil
 }
 
-func (a *app) release(id string) {
-	_, _ = call(http.MethodDelete, a.inventoryURL+"/reservations/"+id, nil)
+func (a *app) release(id string) error {
+	code, err := call(http.MethodDelete, a.inventoryURL+"/reservations/"+id, nil)
+	if err != nil {
+		return err
+	}
+	if code != http.StatusNoContent {
+		return fmt.Errorf("release: %d", code)
+	}
+	return nil
 }
 
 var errPayment = errors.New("payment")
 
 // charge списывает деньги; declined — банк отказал.
-func (a *app) charge(id string, amount int64) (declined bool, err error) {
-	declined, err = a.chargeOnce(id, amount)
-	if err != nil {
-		slog.Warn("оплата не прошла, пробую ещё раз", "id", id, "err", err)
-		declined, err = a.chargeOnce(id, amount)
+func (a *app) charge(id string, amount int64) (bool, error) {
+	a.paymentMu.Lock()
+	if time.Now().Before(a.paymentRetry) || a.paymentProbe {
+		a.paymentMu.Unlock()
+		return false, errPayment
 	}
+	if !a.paymentRetry.IsZero() {
+		a.paymentProbe = true
+	}
+	a.paymentMu.Unlock()
+
+	declined, err := a.chargeOnce(id, amount)
+	if err != nil && a.paymentCaptured(id, amount) {
+		err = nil
+	}
+	a.paymentMu.Lock()
+	a.paymentProbe = false
+	if err != nil {
+		a.paymentFailures++
+		if a.paymentFailures >= 3 {
+			cooldown := 5 * time.Second
+			if errors.Is(err, errPayment) {
+				// An answering bank needs shorter backoff than a hanging one.
+				cooldown = 500 * time.Millisecond
+			}
+			a.paymentRetry = time.Now().Add(cooldown)
+		}
+	} else {
+		a.paymentFailures = 0
+		a.paymentRetry = time.Time{}
+	}
+	a.paymentMu.Unlock()
 	return declined, err
 }
 
@@ -194,7 +239,7 @@ func (a *app) chargeOnce(id string, amount int64) (bool, error) {
 		"order_id":     id,
 		"amount_cents": amount,
 		"currency":     "RUB",
-	})
+	}, id)
 	if err != nil {
 		return false, err
 	}
@@ -207,7 +252,7 @@ func (a *app) chargeOnce(id string, amount int64) (bool, error) {
 	return false, fmt.Errorf("%w: %d", errPayment, code)
 }
 
-func call(method, url string, body any) (int, error) {
+func call(method, url string, body any, key ...string) (int, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -221,7 +266,10 @@ func call(method, url string, body any) (int, error) {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	if len(key) > 0 {
+		req.Header.Set("Idempotency-Key", key[0])
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -234,10 +282,15 @@ func valid(r OrderRequest) bool {
 	if r.UserID == "" || len(r.Items) == 0 {
 		return false
 	}
+	var total int64
 	for _, it := range r.Items {
 		if it.SKU == "" || it.Qty < 1 || it.PriceCents < 0 {
 			return false
 		}
+		if it.PriceCents > (math.MaxInt64-total)/int64(it.Qty) {
+			return false
+		}
+		total += int64(it.Qty) * it.PriceCents
 	}
 	return true
 }
